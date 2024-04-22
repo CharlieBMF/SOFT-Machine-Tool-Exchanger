@@ -3,11 +3,13 @@ import re
 import pymcprotocol
 import ast
 import pyodbc
+import requests
 
 
 class ToolLocation:
-    def __init__(self, location_name, location_ip, location_port, location_network, location_network_plc,
+    def __init__(self, location_id, location_name, location_ip, location_port, location_network, location_network_plc,
                  location_id_line, location_id_machine):
+        self.location_id = location_id
         self.location_name = location_name
         self.location_ip = location_ip
         self.location_port = location_port
@@ -52,13 +54,22 @@ class ToolLocation:
 
 
 class Tool(ToolLocation):
-    def __init__(self, location_name, location_ip, location_port, location_network, location_network_plc,
+    def __init__(self, location_id, location_name, location_ip, location_port, location_network, location_network_plc,
                  location_id_line, location_id_machine, tool_addresses, conn):
 
-        super().__init__(location_name, location_ip, location_port, location_network, location_network_plc,
+        super().__init__(location_id, location_name, location_ip, location_port, location_network, location_network_plc,
                          location_id_line, location_id_machine)
         self.tool_addresses = ast.literal_eval(tool_addresses)
         self.conn_string = conn
+
+    def check_possibility_to_use_at_location(self, tool_data):
+        possible_locations = self.get_possible_locations_SQL(tool_data)
+        #print(possible_locations)
+        if self.location_id in possible_locations:
+            return True
+        else:
+            return False
+
 
     def check_trigger(self):
         self.connect()
@@ -91,15 +102,21 @@ class Tool(ToolLocation):
         return actual_counter[1][0]
 
     def get_tool_data_SQL(self, tool_name):
-        tool_type = tool_name.rsplit('-', 1)[0]
-        tool_number = tool_name.rsplit('-', 1)[1]
         query = (f"SELECT DefID, TypeName, DefToolID, DefReplacementQty, DefProducedQty, DefConfirmation, DefRelease, "
-                 f"StatsProdAllowed, AdrIDLine, AdrIDMachine, StatsDescription "
+                 f"StatsProdAllowed, StatsDescription, DefToolType "
                  f"FROM vToolDefinitionFullView "
-                 f"WHERE TypeName = '{tool_type}' AND DefToolID = '{tool_number}'")
+                 f"WHERE DefToolID = '{tool_name}'")
         tool_data = self.execute_query(query, 'SELECT', 'one')
-        print('Tool data ', tool_data)
+        #print('Tool data ', tool_data)
         return tool_data[0]
+
+    def get_possible_locations_SQL(self, tool_data):
+        query = (f"SELECT idAdr "
+                 f"FROM tToolTypesAdresses "
+                 f"WHERE idType = {tool_data['DefToolType']}")
+        locations_kv = self.execute_query(query, 'SELECT', 'many')
+        locations = [entry['idAdr'] for entry in locations_kv]
+        return locations
 
     def update_tool_data_SQL(self, tool_data, actual_counter):
         current_datetime = datetime.datetime.now()
@@ -114,10 +131,14 @@ class Tool(ToolLocation):
             if task == 1:
                 response = self.generate_ok_response(tool_data, task)
             if task == 2:
-                if (int(tool_data['DefProducedQty']) < int(tool_data['DefReplacementQty']) and
-                        tool_data['DefConfirmation'] and tool_data['DefRelease'] and tool_data['StatsProdAllowed']):
+                possible_to_use_at_this_location = self.check_possibility_to_use_at_location(tool_data)
+                if (int(tool_data['DefProducedQty']) < int(tool_data['DefReplacementQty'])
+                        and tool_data['DefConfirmation']
+                        and tool_data['DefRelease']
+                        and tool_data['StatsProdAllowed']
+                        and possible_to_use_at_this_location):
                     # TOOL IS OK AND CAN BE USED TO PRODUCTION
-                    print('ALLOK')
+                    # print('ALLOK')
                     response = self.generate_ok_response(tool_data, task)
 
                 else:
@@ -148,36 +169,42 @@ class Tool(ToolLocation):
         response = dict(zip(keys, values))
         return response
 
-    def generate_reset_plc_signals(self, task):
-        if task == 1:
-            reseter = {
-                'R_Task_Request_M': 0, 'R_Task_No_W': 0,
-                'R_Tool_Code_ASCII': [0] * len(self.tool_addresses['R_Tool_Code_ASCII']),
-                'R_Actual_Counter_DW': [0],
-                'R_Operator_ASCII': [0] * len(self.tool_addresses['R_Operator_ASCII'])
-            }
-            print('\nRESET FOR DISASSEMBLY', reseter)
-        if task == 2:
-            reseter = {'R_Task_Request_M': 0, 'R_Task_No_W': 0,
-                       'R_Operator_ASCII': [0] * len(self.tool_addresses['R_Operator_ASCII'])}
-            print('RESET FOR ASSEMBLY', reseter)
+    def generate_reset_plc_signals(self, task, error):
+        if error == 0:
+            if task == 1:
+                reseter = {
+                    'R_Task_Request_M': 0,
+    #                'R_Task_No_W': 0,
+                    'R_Tool_Code_ASCII': [0] * len(self.tool_addresses['R_Tool_Code_ASCII']),
+    #                'R_Actual_Counter_DW': [0],
+    #                'R_Operator_ASCII': [0] * len(self.tool_addresses['R_Operator_ASCII'])
+                }
+                # print('\nRESET FOR DISASSEMBLY', reseter)
+            if task == 2:
+                reseter = {'R_Task_Request_M': 0,
+    #                       'R_Task_No_W': 0,
+    #                       'R_Operator_ASCII': [0] * len(self.tool_addresses['R_Operator_ASCII'])
+                           }
+                # print('RESET FOR ASSEMBLY', reseter)
+        if error == 1:
+            reseter = {'R_Task_Request_M': 0}
         return reseter
 
     def send_response_PLC(self, response):
         markers_addresses, markers_values = self.separate_response(response, 'marker')
         words_addresses, words_values = self.separate_response(response, 'word')
         dwords_addresses, dwords_values = self.separate_response(response, 'dword')
-        print(markers_addresses, markers_values)
-        print(words_addresses, words_values)
-        print(dwords_addresses, dwords_values)
-        # self.connect()
-        # self.write_random_bits(markers_addresses, markers_values)
-        # self.write_random_words(word_devices=words_addresses, word_values=words_values,
-        #                         double_word_devices=dwords_addresses, double_word_values=dwords_values)
-        # self.close_connection()
+        # print(markers_addresses, markers_values)
+        # print(words_addresses, words_values)
+        # print(dwords_addresses, dwords_values)
+        self.connect()
+        self.write_random_bits(markers_addresses, markers_values)
+        self.write_random_words(word_devices=words_addresses, word_values=words_values,
+                                double_word_devices=dwords_addresses, double_word_values=dwords_values)
+        self.close_connection()
 
     def separate_response(self, response, type_of_separation):
-        print('\n\nRESPONSE', response, type_of_separation)
+        # print('\n\nRESPONSE', response, type_of_separation)
         if type_of_separation == 'marker':
             separated = {key: value for key, value in response.items() if key.endswith('M')}
             separated_keys = list({self.tool_addresses.get(key, key): value for key, value in separated.items()}.keys())
@@ -195,30 +222,38 @@ class Tool(ToolLocation):
             separated_values = [separated[key] for key in separated.keys()]
             separated_values = [item if not isinstance(sublist, list) else item for sublist in separated_values for
                                 item in (sublist if isinstance(sublist, list) else [sublist])]
-        print(type_of_separation, separated_keys, separated_values)
+        # print(type_of_separation, separated_keys, separated_values)
         return separated_keys, separated_values
 
-    def log_task_to_sql(self, task, tool_name, tool_data, operator_name):
+    def log_task_to_sql(self, task, tool_name, tool_data, operator_name, actual_counter):
         LogToolID = tool_data['DefID']
-        LogLineId = tool_data['AdrIDLine']
-        LogLineMachineID = tool_data['AdrIDMachine']
+        LogLineId = self.location_id_line
+        LogLineMachineID = self.location_id_machine
         current_datetime = datetime.datetime.now()
         LogDate = current_datetime.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-        LogDescription = (
-            f'\'{tool_name} | '
-            f'RepQty: {tool_data["DefReplacementQty"]} | '
-            f'ProdQty: {tool_data["DefProducedQty"]} | '
-            f'Confirmation: {tool_data["DefConfirmation"]} | '
-            f'Release: {tool_data["DefRelease"]} | '
-            f'Status: {tool_data["StatsDescription"]}\''
-        )
         LogUserLogin = operator_name
 
         if task == 1:
             LogType = 4
+            LogDescription = (
+                f'\'{tool_name} | '
+                f'RepQty: {tool_data["DefReplacementQty"]} | '
+                f'ProdQty: {actual_counter} | '
+                f'Confirmation: {tool_data["DefConfirmation"]} | '
+                f'Release: {tool_data["DefRelease"]} | '
+                f'Status: {tool_data["StatsDescription"]}\''
+            )
 
         if task == 2:
             LogType = 3
+            LogDescription = (
+                f'\'{tool_name} | '
+                f'RepQty: {tool_data["DefReplacementQty"]} | '
+                f'ProdQty: {tool_data["DefProducedQty"]} | '
+                f'Confirmation: {tool_data["DefConfirmation"]} | '
+                f'Release: {tool_data["DefRelease"]} | '
+                f'Status: {tool_data["StatsDescription"]}\''
+            )
 
         query = (f'INSERT INTO tToolLogs (LogToolID, LogLineId, LogMachineID, LogDate, LogType, LogDescription, '
                  f'LogUserLogin) VALUES ({LogToolID}, {LogLineId}, {LogLineMachineID}, \'{LogDate}\', {LogType}, '
@@ -233,7 +268,8 @@ class Tool(ToolLocation):
             self.cursor_execution(query, type_of_query, range_of_query)
 
     def cursor_execution(self, query, type_of_query, range_of_query):
-        print('\n', query, '\n')
+        print('\n', query, '\n', type_of_query, range_of_query)
+        self.log_query_to_slack(query)
         cnxn = pyodbc.connect(self.conn_string, timeout=1)
         cursor = cnxn.cursor()
         cursor.execute(query)
@@ -245,6 +281,12 @@ class Tool(ToolLocation):
                 if result is None:
                     raise Exception(f'Response None from SQL for fetch tool query: {query}')
                 zipped = [dict(zip(columns, result))]
+            if range_of_query == 'many':
+                result = cursor.fetchall()
+                if not result:
+                    raise Exception(f'Response None from SQL for fetch tool query: {query}')
+                # Assuming columns is a list of column names
+                zipped = [dict(zip(columns, row)) for row in result]
 
         if type_of_query == 'INSERT' or type_of_query == 'UPDATE':
             cursor.commit()
@@ -253,14 +295,23 @@ class Tool(ToolLocation):
         del cnxn
         return zipped
 
+    def log_query_to_slack(self, query):
+        date = str(datetime.datetime.now())
+        final_json = {"text": date + " -- " + str(self.location_name) + " -- " + query}
+        response = requests.post(
+            'https://hooks.slack.com/services/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',
+            json=final_json
+        )
 
     @staticmethod
     def convert_to_ascii(decimal_list):
         binary = [bin(b).replace('0b', '').zfill(16) for b in decimal_list]
         halves_list = [half for word in binary for half in (word[len(word) // 2:], word[:len(word) // 2])]
         ascii_string = ''.join([chr(int(binary, 2)) for binary in halves_list])
-        ascii_string_result = re.sub(r'[^a-zA-Z0-9-]', '', ascii_string)
+        ascii_string_result = re.sub(r'[^a-zA-Z0-9/-]', '', ascii_string)
         return ascii_string_result
+
+
 
 
 
